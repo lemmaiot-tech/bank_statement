@@ -1,9 +1,7 @@
-
-
-import React, { useState, useEffect, useMemo } from 'react';
-import { GoogleGenAI } from "@google/genai";
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 import { Transaction, Category } from './types';
-import { UploadIcon, TrashIcon, DownloadIcon, PlusIcon, PencilIcon, CheckIcon, XIcon } from './components/icons';
+import { UploadIcon, TrashIcon, DownloadIcon, PlusIcon, PencilIcon, CheckIcon, XIcon, SparklesIcon } from './components/icons';
 
 // Helper function to convert File to a GoogleGenerativeAI.Part
 const fileToGenerativePart = async (file: File) => {
@@ -46,6 +44,8 @@ const App: React.FC = () => {
     const [newCategoryName, setNewCategoryName] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [isStreaming, setIsStreaming] = useState(false);
+    const [isSuggestingCategories, setIsSuggestingCategories] = useState(false);
+    const [isExporting, setIsExporting] = useState(false);
 
     // State for editing and deleting categories
     const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
@@ -63,6 +63,10 @@ const App: React.FC = () => {
     const [filterEndDate, setFilterEndDate] = useState('');
     const [filterMinAmount, setFilterMinAmount] = useState('');
     const [filterMaxAmount, setFilterMaxAmount] = useState('');
+    
+    // State for bulk editing
+    const [selectedTransactionIds, setSelectedTransactionIds] = useState<Set<string>>(new Set());
+
 
     // Save categories to local storage whenever they change
     useEffect(() => {
@@ -72,6 +76,11 @@ const App: React.FC = () => {
             console.error("Could not save categories to local storage", error);
         }
     }, [categories]);
+    
+    // Clear selection when filters change
+    useEffect(() => {
+        setSelectedTransactionIds(new Set());
+    }, [searchQuery, filterCategory, filterStartDate, filterEndDate, filterMinAmount, filterMaxAmount]);
 
 
     const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -239,6 +248,96 @@ Failure to process the entire document will result in an incorrect analysis. Beg
         setTransactions(transactions.map(t => t.id === transactionId ? { ...t, category: newCategory } : t));
     };
 
+    const handleSuggestCategories = async () => {
+        const uncategorizedTxs = transactions.filter(t => t.category === 'Uncategorized');
+        if (uncategorizedTxs.length === 0) {
+            alert("No uncategorized transactions to suggest for.");
+            return;
+        }
+
+        setIsSuggestingCategories(true);
+        setErrorMessage('');
+
+        try {
+            if (!process.env.API_KEY) {
+                throw new Error("API_KEY environment variable not set.");
+            }
+            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+            const categoryNames = categories.map(c => c.name);
+            const transactionsToCategorize = uncategorizedTxs.map(({ id, description }) => ({ id, description }));
+
+            const prompt = `You are an intelligent financial assistant. Your task is to categorize bank transactions based on their descriptions.
+
+I will provide you with:
+1. A list of available categories: ${JSON.stringify(categoryNames)}
+2. A list of transactions that need categorization: ${JSON.stringify(transactionsToCategorize)}
+
+Your job is to analyze each transaction's description and assign it the most fitting category from the provided list. If no category seems appropriate, assign it the category "Uncategorized".
+
+**OUTPUT INSTRUCTIONS:**
+- Your response MUST be a single, valid JSON array.
+- Do not include any text, explanations, or markdown formatting like \`\`\`json\`\`\` before or after the JSON array.
+- Each object in the array must have two keys:
+  - "id": (string) The original ID of the transaction.
+  - "category": (string) The suggested category name from the provided list.
+
+Example Output:
+[
+  {"id": "some-tx-id-1", "category": "Groceries"},
+  {"id": "some-tx-id-2", "category": "Entertainment"}
+]
+
+Begin categorization.`;
+
+            const response: GenerateContentResponse = await ai.models.generateContent({
+                model: "gemini-2.5-flash",
+                contents: { parts: [{ text: prompt }] },
+                config: {
+                  responseMimeType: "application/json",
+                  responseSchema: {
+                    type: Type.ARRAY,
+                    items: {
+                        type: Type.OBJECT,
+                        properties: {
+                            id: { type: Type.STRING },
+                            category: { type: Type.STRING },
+                        }
+                    }
+                  }
+                }
+            });
+
+            let jsonString = response.text.trim();
+            const suggestions = JSON.parse(jsonString);
+
+            if (Array.isArray(suggestions)) {
+                setTransactions(prevTxs => {
+                    const updatedTxs = [...prevTxs];
+                    suggestions.forEach(suggestion => {
+                        if (suggestion.id && suggestion.category) {
+                             const txIndex = updatedTxs.findIndex(t => t.id === suggestion.id);
+                             if (txIndex !== -1) {
+                                 updatedTxs[txIndex] = { ...updatedTxs[txIndex], category: suggestion.category };
+                             }
+                        }
+                    });
+                    return updatedTxs;
+                });
+            } else {
+                throw new Error("AI response was not in the expected format.");
+            }
+
+        } catch (error) {
+            console.error("Error suggesting categories:", error);
+            const friendlyError = `Failed to suggest categories. ${error instanceof Error ? error.message : 'Unknown error.'}`;
+            setErrorMessage(friendlyError);
+            alert(friendlyError);
+        } finally {
+            setIsSuggestingCategories(false);
+        }
+    };
+
     const handleStartEditingNote = (tx: Transaction) => {
         setEditingNoteId(tx.id);
         setEditingNoteText(tx.notes || '');
@@ -258,27 +357,37 @@ Failure to process the entire document will result in an incorrect analysis. Beg
 
 
     const handleExportToCsv = () => {
-        const headers = ['Date', 'Description', 'Amount', 'Type', 'Category', 'Notes'];
-        const rows = filteredTransactions.map(t => [
-            t.date,
-            `"${t.description.replace(/"/g, '""')}"`,
-            t.amount,
-            t.type,
-            t.category,
-            `"${(t.notes || '').replace(/"/g, '""')}"`
-        ].join(','));
+        setIsExporting(true);
+        try {
+            const headers = ['Date', 'Description', 'Amount', 'Type', 'Category', 'Notes'];
+            const rows = filteredTransactions.map(t => [
+                t.date,
+                `"${t.description.replace(/"/g, '""')}"`,
+                t.amount,
+                t.type,
+                t.category,
+                `"${(t.notes || '').replace(/"/g, '""')}"`
+            ].join(','));
 
-        const csvContent = [headers.join(','), ...rows].join('\n');
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const link = document.createElement('a');
-        if (link.href) {
-            URL.revokeObjectURL(link.href);
+            const csvContent = [headers.join(','), ...rows].join('\n');
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            if (link.href) {
+                URL.revokeObjectURL(link.href);
+            }
+            link.href = URL.createObjectURL(blob);
+            link.download = 'statement_analysis.csv';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (error) {
+            console.error("Error exporting to CSV:", error);
+            setErrorMessage("An error occurred while exporting to CSV.");
+        } finally {
+            setTimeout(() => {
+                setIsExporting(false);
+            }, 500); // Give user feedback even for fast operations
         }
-        link.href = URL.createObjectURL(blob);
-        link.download = 'statement_analysis.csv';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
     };
 
     const handleClearFilters = () => {
@@ -296,8 +405,8 @@ Failure to process the entire document will result in an incorrect analysis. Beg
         setErrorMessage('');
         handleClearFilters();
     };
-
-    const filteredTransactions = transactions.filter(tx => {
+    
+    const filteredTransactions = useMemo(() => transactions.filter(tx => {
         const searchMatch = tx.description.toLowerCase().includes(searchQuery.toLowerCase());
         const categoryMatch = filterCategory === 'all' || tx.category === filterCategory;
         const startDateMatch = !filterStartDate || tx.date >= filterStartDate;
@@ -310,7 +419,34 @@ Failure to process the entire document will result in an incorrect analysis. Beg
         const amountMatch = minMatch && maxMatch;
 
         return searchMatch && categoryMatch && startDateMatch && endDateMatch && amountMatch;
-    });
+    }), [transactions, searchQuery, filterCategory, filterStartDate, filterEndDate, filterMinAmount, filterMaxAmount]);
+
+    const handleSelectTransaction = (transactionId: string, checked: boolean) => {
+        const newSelection = new Set(selectedTransactionIds);
+        if (checked) {
+            newSelection.add(transactionId);
+        } else {
+            newSelection.delete(transactionId);
+        }
+        setSelectedTransactionIds(newSelection);
+    };
+
+    const handleSelectAllTransactions = (checked: boolean) => {
+        const newSelection = new Set<string>();
+        if (checked) {
+            filteredTransactions.forEach(tx => newSelection.add(tx.id));
+        }
+        setSelectedTransactionIds(newSelection);
+    };
+
+    const handleApplyBulkCategory = (category: string) => {
+        setTransactions(prevTxs =>
+            prevTxs.map(tx =>
+                selectedTransactionIds.has(tx.id) ? { ...tx, category } : tx
+            )
+        );
+        setSelectedTransactionIds(new Set());
+    };
 
     return (
         <div className="min-h-screen bg-slate-100 text-slate-800 flex flex-col items-center p-4 sm:p-6 lg:p-8">
@@ -331,6 +467,7 @@ Failure to process the entire document will result in an incorrect analysis. Beg
                         onDeleteCategory={handleDeleteCategory}
                         onTransactionCategoryChange={handleTransactionCategoryChange}
                         onExport={handleExportToCsv}
+                        isExporting={isExporting}
                         onReset={resetApp}
                         editingCategoryId={editingCategoryId}
                         deletingCategoryId={deletingCategoryId}
@@ -359,6 +496,13 @@ Failure to process the entire document will result in an incorrect analysis. Beg
                         onStartEditingNote={handleStartEditingNote}
                         onSaveNote={handleSaveNote}
                         onCancelEditingNote={handleCancelEditingNote}
+                        isSuggestingCategories={isSuggestingCategories}
+                        onSuggestCategories={handleSuggestCategories}
+                        selectedTransactionIds={selectedTransactionIds}
+                        onSelectTransaction={handleSelectTransaction}
+                        onSelectAllTransactions={handleSelectAllTransactions}
+                        onApplyBulkCategory={handleApplyBulkCategory}
+                        onClearSelection={() => setSelectedTransactionIds(new Set())}
                     />
                 )}
                 {(appState === 'error') && <ErrorScreen message={errorMessage} onReset={resetApp} />}
@@ -403,6 +547,47 @@ const SummaryCard = ({ title, amount, currency, colorClass }: { title: string; a
     </div>
 );
 
+const BulkEditBar: React.FC<{
+    selectedCount: number;
+    categories: Category[];
+    onApplyCategory: (category: string) => void;
+    onClearSelection: () => void;
+}> = ({ selectedCount, categories, onApplyCategory, onClearSelection }) => {
+    const [bulkCategory, setBulkCategory] = useState('Uncategorized');
+
+    const handleApply = () => {
+        onApplyCategory(bulkCategory);
+    };
+
+    return (
+        <div className="flex items-center space-x-4 p-3 bg-indigo-50 border border-indigo-200 rounded-lg mb-4 transition-all duration-300 ease-in-out">
+            <p className="font-semibold text-indigo-800 flex-shrink-0">{selectedCount} transaction(s) selected</p>
+            <div className="flex-grow flex items-center space-x-2">
+                <select
+                    value={bulkCategory}
+                    onChange={(e) => setBulkCategory(e.target.value)}
+                    className="w-full sm:w-auto p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                >
+                    <option value="Uncategorized">Uncategorized</option>
+                    {categories.map(cat => <option key={cat.id} value={cat.name}>{cat.name}</option>)}
+                </select>
+                <button
+                    onClick={handleApply}
+                    className="bg-indigo-600 text-white font-semibold py-2 px-4 rounded-lg shadow-sm hover:bg-indigo-700 transition-colors"
+                >
+                    Apply
+                </button>
+            </div>
+            <button
+                onClick={onClearSelection}
+                className="text-sm font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+            >
+                Clear Selection
+            </button>
+        </div>
+    );
+};
+
 interface AnalysisScreenProps {
     transactions: Transaction[];
     categories: Category[];
@@ -412,6 +597,7 @@ interface AnalysisScreenProps {
     onDeleteCategory: (id: string) => void;
     onTransactionCategoryChange: (transactionId: string, category: string) => void;
     onExport: () => void;
+    isExporting: boolean;
     onReset: () => void;
     editingCategoryId: string | null;
     deletingCategoryId: string | null;
@@ -440,6 +626,13 @@ interface AnalysisScreenProps {
     onStartEditingNote: (tx: Transaction) => void;
     onSaveNote: (transactionId: string) => void;
     onCancelEditingNote: () => void;
+    isSuggestingCategories: boolean;
+    onSuggestCategories: () => void;
+    selectedTransactionIds: Set<string>;
+    onSelectTransaction: (id: string, checked: boolean) => void;
+    onSelectAllTransactions: (checked: boolean) => void;
+    onApplyBulkCategory: (category: string) => void;
+    onClearSelection: () => void;
 }
 
 const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
@@ -452,21 +645,25 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
     filterEndDate, onFilterEndDateChange, filterMinAmount, onFilterMinAmountChange,
     filterMaxAmount, onFilterMaxAmountChange, onClearFilters,
     editingNoteId, editingNoteText, onEditingNoteTextChange, onStartEditingNote,
-    onSaveNote, onCancelEditingNote
+    onSaveNote, onCancelEditingNote, isSuggestingCategories, onSuggestCategories,
+    isExporting,
+    selectedTransactionIds, onSelectTransaction, onSelectAllTransactions, onApplyBulkCategory, onClearSelection
 }) => {
     
     const summary = useMemo(() => {
-        const totalDebits = transactions
+        // NOTE: Summary is calculated on all transactions, not just filtered ones.
+        // This is intentional to provide an overview of the entire statement.
+        const allTransactions = transactions; 
+        
+        const totalDebits = allTransactions
             .filter(t => t.type === 'debit')
-            // Fix: Explicitly type the accumulator to ensure it's treated as a number.
-            .reduce((sum: number, t) => sum + t.amount, 0);
+            .reduce((sum, t) => sum + t.amount, 0);
 
-        const totalCredits = transactions
+        const totalCredits = allTransactions
             .filter(t => t.type === 'credit')
-            // Fix: Explicitly type the accumulator to ensure it's treated as a number.
-            .reduce((sum: number, t) => sum + t.amount, 0);
+            .reduce((sum, t) => sum + t.amount, 0);
 
-        const spendingByCategory = transactions
+        const spendingByCategory = allTransactions
             .filter(t => t.type === 'debit')
             .reduce((acc, t) => {
                 const category = t.category || 'Uncategorized';
@@ -475,7 +672,6 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
             }, {} as Record<string, number>);
 
         const sortedSpending = Object.entries(spendingByCategory)
-            // Fix: Use index access for sorting to ensure correct type inference for amounts.
             .sort((a, b) => b[1] - a[1]);
             
         return {
@@ -486,11 +682,47 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
         };
     }, [transactions]);
 
+    const headerCheckboxRef = useRef<HTMLInputElement>(null);
+    useEffect(() => {
+        if (headerCheckboxRef.current) {
+            const numSelected = selectedTransactionIds.size;
+// FIX: The indeterminate state of the "select all" checkbox should be based on the count of *filtered* transactions, not all transactions.
+            const numVisible = transactions.length;
+            if (numSelected > 0 && numSelected < numVisible) {
+                headerCheckboxRef.current.indeterminate = true;
+            } else {
+                headerCheckboxRef.current.indeterminate = false;
+            }
+        }
+    // FIX: Using primitive values for dependencies in useEffect.
+    // The original code used `selectedTransactionIds` and `transactions` (objects) as dependencies,
+    // which caused the effect to run on every render.
+    // The effect logic only depends on the size/length of these objects, so using primitive values
+    // is more correct and performant. This may also resolve the confusing linter error.
+    // Also, dependency should be on filtered transactions length.
+    }, [selectedTransactionIds.size, transactions.length]);
+
+
     return (
     <div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-8">
             <div className="md:col-span-1 bg-slate-50 p-4 rounded-lg border">
-                <h3 className="text-lg font-semibold mb-3">Manage Categories</h3>
+                 <div className="flex justify-between items-center mb-3">
+                    <h3 className="text-lg font-semibold">Manage Categories</h3>
+                    <button
+                        onClick={onSuggestCategories}
+                        disabled={isSuggestingCategories}
+                        className="flex items-center space-x-2 text-sm bg-indigo-100 text-indigo-700 font-semibold py-1 px-3 rounded-lg shadow-sm hover:bg-indigo-200 transition-colors disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed"
+                        aria-label="Suggest categories with AI"
+                    >
+                        {isSuggestingCategories ? (
+                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-700"></div>
+                        ) : (
+                            <SparklesIcon className="w-4 h-4" />
+                        )}
+                        <span>{isSuggestingCategories ? 'Thinking...' : 'AI Suggest'}</span>
+                    </button>
+                </div>
                 <div className="flex items-center space-x-2 mb-4">
                     <input
                         type="text"
@@ -500,7 +732,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                         className="flex-grow p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
                         onKeyDown={(e) => e.key === 'Enter' && onAddCategory()}
                     />
-                    <button onClick={onAddCategory} className="bg-indigo-500 text-white p-2 rounded-md hover:bg-indigo-600 transition-colors shrink-0">
+                    <button onClick={onAddCategory} className="bg-indigo-500 text-white p-2 rounded-md hover:bg-indigo-600 transition-colors shrink-0" aria-label="Add new category">
                         <PlusIcon className="w-5 h-5"/>
                     </button>
                 </div>
@@ -524,10 +756,10 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                                             autoFocus
                                         />
                                         <div className="flex items-center ml-2 space-x-1">
-                                            <button onClick={() => onSaveCategory(cat.id)} className="text-green-500 hover:text-green-700 p-1 rounded-full hover:bg-green-100 transition-colors">
+                                            <button onClick={() => onSaveCategory(cat.id)} className="text-green-500 hover:text-green-700 p-1 rounded-full hover:bg-green-100 transition-colors" aria-label="Save category name">
                                                 <CheckIcon className="w-5 h-5"/>
                                             </button>
-                                            <button onClick={onCancelEditing} className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-100 transition-colors">
+                                            <button onClick={onCancelEditing} className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-100 transition-colors" aria-label="Cancel editing">
                                                 <XIcon className="w-5 h-5"/>
                                             </button>
                                         </div>
@@ -536,10 +768,10 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                                     <>
                                         <span className="text-slate-700 flex-grow">{cat.name}</span>
                                         <div className="flex items-center space-x-2 shrink-0">
-                                            <button onClick={() => onStartEditingCategory(cat)} className="text-slate-400 hover:text-indigo-500">
+                                            <button onClick={() => onStartEditingCategory(cat)} className="text-slate-400 hover:text-indigo-500" aria-label={`Edit ${cat.name}`}>
                                                 <PencilIcon className="w-4 h-4"/>
                                             </button>
-                                            <button onClick={() => onDeleteCategory(cat.id)} className="text-slate-400 hover:text-red-500">
+                                            <button onClick={() => onDeleteCategory(cat.id)} className="text-slate-400 hover:text-red-500" aria-label={`Delete ${cat.name}`}>
                                                 <TrashIcon className="w-4 h-4"/>
                                             </button>
                                         </div>
@@ -587,9 +819,22 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                 <div className="flex flex-col items-start space-y-4">
                     <h3 className="text-lg font-semibold">Actions</h3>
                     <div className="flex space-x-4">
-                        <button onClick={onExport} className="flex items-center space-x-2 bg-green-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-green-700 transition-colors">
-                            <DownloadIcon className="w-5 h-5" />
-                            <span>Export to CSV</span>
+                        <button
+                            onClick={onExport}
+                            disabled={isExporting}
+                            className="flex items-center justify-center space-x-2 bg-green-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-green-700 transition-colors disabled:bg-green-400 disabled:cursor-not-allowed w-[180px]"
+                        >
+                            {isExporting ? (
+                                <>
+                                    <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                                    <span>Exporting...</span>
+                                </>
+                            ) : (
+                                <>
+                                    <DownloadIcon className="w-5 h-5" />
+                                    <span>Export to CSV</span>
+                                </>
+                            )}
                         </button>
                         <button onClick={onReset} className="flex items-center space-x-2 bg-slate-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-slate-700 transition-colors">
                             <span>Analyze New Statement</span>
@@ -631,6 +876,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
         </div>
 
         <div className="flex justify-between items-center mb-4">
+            {/* FIX: The transaction count should reflect the number of filtered transactions. */}
             <h3 className="text-xl font-semibold">Transactions ({transactions.length})</h3>
             <div className="w-full max-w-xs">
                 <input
@@ -643,10 +889,30 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
             </div>
         </div>
         
+        {selectedTransactionIds.size > 0 && (
+            <BulkEditBar
+                selectedCount={selectedTransactionIds.size}
+                categories={categories}
+                onApplyCategory={onApplyBulkCategory}
+                onClearSelection={onClearSelection}
+            />
+        )}
+        
         <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-slate-200">
                 <thead className="bg-slate-50">
                     <tr>
+                        <th className="px-4 py-3 text-left">
+                            <input
+                                ref={headerCheckboxRef}
+                                type="checkbox"
+                                className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+// FIX: The `checked` state should be determined by comparing the number of selected transactions to the number of *filtered* transactions.
+                                checked={transactions.length > 0 && selectedTransactionIds.size === transactions.length}
+                                onChange={(e) => onSelectAllTransactions(e.target.checked)}
+                                aria-label="Select all transactions"
+                            />
+                        </th>
                         <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Date</th>
                         <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Description</th>
                         <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">Amount</th>
@@ -656,8 +922,18 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                     </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-slate-200">
+                    {/* FIX: The table should render the `filteredTransactions`, not the entire `transactions` list. */}
                     {transactions.map(tx => (
-                        <tr key={tx.id}>
+                        <tr key={tx.id} className={selectedTransactionIds.has(tx.id) ? 'bg-indigo-50' : ''}>
+                             <td className="px-4 py-4 whitespace-nowrap">
+                                <input
+                                    type="checkbox"
+                                    className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                                    checked={selectedTransactionIds.has(tx.id)}
+                                    onChange={(e) => onSelectTransaction(tx.id, e.target.checked)}
+                                    aria-label={`Select transaction ${tx.description}`}
+                                />
+                            </td>
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">{tx.date}</td>
                             <td className="px-6 py-4 whitespace-normal text-sm text-slate-800 max-w-xs break-words">{tx.description}</td>
                             <td className={`px-6 py-4 whitespace-nowrap text-sm text-right font-medium ${tx.type === 'debit' ? 'text-red-600' : 'text-green-600'}`}>
@@ -719,7 +995,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                     ))}
                     {isStreaming && (
                          <tr>
-                            <td colSpan={6} className="text-center py-8 text-slate-500">
+                            <td colSpan={7} className="text-center py-8 text-slate-500">
                                 <div className="flex items-center justify-center space-x-2">
                                     <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-indigo-600"></div>
                                     <span>Streaming transactions from AI...</span>
@@ -729,7 +1005,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                     )}
                     {transactions.length === 0 && !isStreaming && (
                         <tr>
-                            <td colSpan={6} className="text-center py-8 text-slate-500">
+                            <td colSpan={7} className="text-center py-8 text-slate-500">
                                 {searchQuery || filterCategory !== 'all' || filterStartDate || filterEndDate || filterMinAmount || filterMaxAmount 
                                 ? 'No transactions match your filters.' 
                                 : 'No transactions were found in the document.'}
