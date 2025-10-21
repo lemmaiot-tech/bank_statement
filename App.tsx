@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 import { Transaction, Category } from './types';
@@ -18,54 +19,158 @@ const fileToGenerativePart = async (file: File) => {
     };
 };
 
+// Creates a consistent, unique key for a transaction to persist its note
+const createTransactionKey = (tx: { date: string, description: string, amount: number, type: 'debit' | 'credit' }): string => {
+    const normalizedDescription = tx.description.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 50);
+    return `tx_note::${tx.date}_${normalizedDescription}_${tx.amount}_${tx.type}`;
+};
 
-type AppState = 'upload' | 'analyzing' | 'error';
+
+type AppState = 'init' | 'upload' | 'analyzing' | 'error';
+
+const NoteEditModal = ({ transaction, onSave, onClose }: { transaction: Transaction | null, onSave: (txId: string, note: string) => void, onClose: () => void }) => {
+    const [noteText, setNoteText] = useState('');
+    const textAreaRef = useRef<HTMLTextAreaElement>(null);
+
+    useEffect(() => {
+        if (transaction) {
+            setNoteText(transaction.notes || '');
+            // Auto-focus the textarea when the modal opens
+            setTimeout(() => textAreaRef.current?.focus(), 100);
+        }
+    }, [transaction]);
+    
+    useEffect(() => {
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                onClose();
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [onClose]);
+
+    if (!transaction) return null;
+
+    const handleSave = () => {
+        onSave(transaction.id, noteText);
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4 transition-opacity duration-300" onClick={onClose}>
+            <div className="bg-white rounded-lg shadow-xl w-full max-w-lg transform transition-all duration-300 scale-95 opacity-0 animate-fade-in-scale" onClick={e => e.stopPropagation()}>
+                <div className="p-6">
+                    <h3 className="text-lg font-semibold text-slate-800 mb-2">Edit Note</h3>
+                    <p className="text-sm text-slate-500 mb-4 truncate" title={transaction.description}>
+                        For: <span className="font-medium text-slate-700">{transaction.description}</span>
+                    </p>
+                    <textarea
+                        ref={textAreaRef}
+                        value={noteText}
+                        onChange={(e) => setNoteText(e.target.value)}
+                        className="w-full p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-base"
+                        rows={6}
+                        placeholder="Add your note here..."
+                    />
+                </div>
+                <div className="bg-slate-50 px-6 py-4 flex justify-end items-center space-x-3 rounded-b-lg">
+                    <button onClick={onClose} className="text-sm font-semibold text-slate-600 hover:text-slate-800 transition-colors px-4 py-2 rounded-md hover:bg-slate-200">Cancel</button>
+                    <button onClick={handleSave} className="bg-indigo-600 text-white font-semibold py-2 px-6 rounded-lg shadow-sm hover:bg-indigo-700 transition-colors">Save Note</button>
+                </div>
+            </div>
+            <style>{`
+                @keyframes fade-in-scale {
+                    from { opacity: 0; transform: scale(0.95); }
+                    to { opacity: 1; transform: scale(1); }
+                }
+                .animate-fade-in-scale {
+                    animation: fade-in-scale 0.2s ease-out forwards;
+                }
+            `}</style>
+        </div>
+    );
+};
+
 
 const App: React.FC = () => {
-    const [appState, setAppState] = useState<AppState>('upload');
+    const [appState, setAppState] = useState<AppState>('init');
     const [transactions, setTransactions] = useState<Transaction[]>([]);
     const [categories, setCategories] = useState<Category[]>(() => {
-        try {
-            const savedCategories = localStorage.getItem('bankAnalyzerCategories');
-            if (savedCategories) {
-                return JSON.parse(savedCategories);
-            }
-        } catch (error) {
-            console.error("Could not load categories from local storage", error);
-        }
-        // Default categories if nothing in local storage or if parsing fails
-        return [
+        const defaultCategories = [
             { id: '1', name: 'Groceries' },
             { id: '2', name: 'Utilities' },
             { id: '3', name: 'Rent' },
             { id: '4', name: 'Entertainment' },
         ];
+        try {
+            const savedCategories = localStorage.getItem('bankAnalyzerCategories');
+            if (savedCategories) {
+                const parsed = JSON.parse(savedCategories);
+                // Ensure we load saved categories only if it's a non-empty array
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    return parsed;
+                }
+            }
+        } catch (error) {
+            console.error("Could not load categories from local storage", error);
+        }
+        // Return default categories if nothing is saved, it's empty, or data is corrupted
+        return defaultCategories;
     });
     const [newCategoryName, setNewCategoryName] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [isStreaming, setIsStreaming] = useState(false);
-    const [isSuggestingCategories, setIsSuggestingCategories] = useState(false);
     const [isExporting, setIsExporting] = useState(false);
+    
+    const [suggestingForTxId, setSuggestingForTxId] = useState<string | null>(null);
 
-    // State for editing and deleting categories
     const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
     const [editingCategoryName, setEditingCategoryName] = useState('');
     const [deletingCategoryId, setDeletingCategoryId] = useState<string | null>(null);
 
-    // State for editing notes
-    const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
-    const [editingNoteText, setEditingNoteText] = useState('');
+    const [editingTransactionForNote, setEditingTransactionForNote] = useState<Transaction | null>(null);
 
-    // State for filtering
     const [searchQuery, setSearchQuery] = useState('');
     const [filterCategory, setFilterCategory] = useState('all');
+    const [filterType, setFilterType] = useState<'all' | 'debit' | 'credit'>('all');
     const [filterStartDate, setFilterStartDate] = useState('');
     const [filterEndDate, setFilterEndDate] = useState('');
     const [filterMinAmount, setFilterMinAmount] = useState('');
     const [filterMaxAmount, setFilterMaxAmount] = useState('');
     
-    // State for bulk editing
     const [selectedTransactionIds, setSelectedTransactionIds] = useState<Set<string>>(new Set());
+    
+    // Load transactions from local storage on initial mount
+    useEffect(() => {
+        try {
+            const savedTxs = localStorage.getItem('bankAnalyzerLastSession');
+            if (savedTxs) {
+                const parsedTxs: Transaction[] = JSON.parse(savedTxs);
+                if (parsedTxs.length > 0) {
+                    setTransactions(parsedTxs);
+                    setAppState('analyzing');
+                    return;
+                }
+            }
+        } catch (error) {
+            console.error("Could not load transactions from local storage", error);
+            localStorage.removeItem('bankAnalyzerLastSession'); // Clear corrupted data
+        }
+        setAppState('upload'); // Go to upload screen if no valid session found
+    }, []);
+
+    // Save transactions to local storage whenever they change
+    useEffect(() => {
+        // We only want to save when in the 'analyzing' state with transactions.
+        // This prevents wiping storage on reset or initial load.
+        if (appState === 'analyzing' && transactions.length > 0) {
+            try {
+                localStorage.setItem('bankAnalyzerLastSession', JSON.stringify(transactions));
+            } catch (error) {
+                console.error("Could not save transactions to local storage", error);
+            }
+        }
+    }, [transactions, appState]);
 
 
     // Save categories to local storage whenever they change
@@ -80,14 +185,15 @@ const App: React.FC = () => {
     // Clear selection when filters change
     useEffect(() => {
         setSelectedTransactionIds(new Set());
-    }, [searchQuery, filterCategory, filterStartDate, filterEndDate, filterMinAmount, filterMaxAmount]);
+    }, [searchQuery, filterCategory, filterType, filterStartDate, filterEndDate, filterMinAmount, filterMaxAmount]);
 
 
     const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
         if (file && file.type === 'application/pdf') {
             setAppState('analyzing');
-            setTransactions([]);
+            setTransactions([]); // Clear previous transactions before starting
+            localStorage.removeItem('bankAnalyzerLastSession'); // Clear old session
             setErrorMessage('');
             setIsStreaming(true);
             try {
@@ -121,6 +227,8 @@ Failure to process the entire document will result in an incorrect analysis. Beg
 
                 let buffer = '';
                 let transactionCount = 0;
+                let finalTransactions: Transaction[] = [];
+
                 for await (const chunk of stream) {
                     buffer += chunk.text;
                     const lines = buffer.split('\n');
@@ -133,10 +241,13 @@ Failure to process the entire document will result in an incorrect analysis. Beg
                             try {
                                 const txData = JSON.parse(line);
                                 if (txData.date && txData.description && typeof txData.amount === 'number' && txData.type) {
+                                    const noteKey = createTransactionKey(txData);
+                                    const savedNote = localStorage.getItem(noteKey);
                                     newTxs.push({
                                         ...txData,
                                         id: `${Date.now()}-${transactionCount++}`,
                                         category: 'Uncategorized',
+                                        notes: savedNote ?? undefined,
                                     });
                                 }
                             } catch (e) {
@@ -145,7 +256,8 @@ Failure to process the entire document will result in an incorrect analysis. Beg
                         }
                     }
                     if (newTxs.length > 0) {
-                        setTransactions(prev => [...prev, ...newTxs]);
+                        finalTransactions = [...finalTransactions, ...newTxs];
+                        setTransactions(finalTransactions);
                     }
                 }
 
@@ -153,11 +265,15 @@ Failure to process the entire document will result in an incorrect analysis. Beg
                      try {
                         const txData = JSON.parse(buffer);
                          if (txData.date && txData.description && typeof txData.amount === 'number' && txData.type) {
-                            setTransactions(prev => [...prev, {
+                            const noteKey = createTransactionKey(txData);
+                            const savedNote = localStorage.getItem(noteKey);
+                            const finalTx = {
                                 ...txData,
                                 id: `${Date.now()}-${transactionCount++}`,
                                 category: 'Uncategorized',
-                            }]);
+                                notes: savedNote ?? undefined,
+                            };
+                            setTransactions(prev => [...prev, finalTx]);
                         }
                     } catch(e) {
                         console.error("Could not parse final buffer content:", buffer);
@@ -248,14 +364,11 @@ Failure to process the entire document will result in an incorrect analysis. Beg
         setTransactions(transactions.map(t => t.id === transactionId ? { ...t, category: newCategory } : t));
     };
 
-    const handleSuggestCategories = async () => {
-        const uncategorizedTxs = transactions.filter(t => t.category === 'Uncategorized');
-        if (uncategorizedTxs.length === 0) {
-            alert("No uncategorized transactions to suggest for.");
-            return;
-        }
+    const handleSuggestSingleCategory = async (transactionId: string) => {
+        const transaction = transactions.find(t => t.id === transactionId);
+        if (!transaction) return;
 
-        setIsSuggestingCategories(true);
+        setSuggestingForTxId(transactionId);
         setErrorMessage('');
 
         try {
@@ -264,29 +377,23 @@ Failure to process the entire document will result in an incorrect analysis. Beg
             }
             const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-            const categoryNames = categories.map(c => c.name);
-            const transactionsToCategorize = uncategorizedTxs.map(({ id, description }) => ({ id, description }));
-
-            const prompt = `You are an intelligent financial assistant. Your task is to categorize bank transactions based on their descriptions.
+            const categoryNames = categories.map(c => c.name).filter(c => c !== 'Uncategorized');
+            
+            const prompt = `You are an intelligent financial assistant. Your task is to categorize a bank transaction based on its description.
 
 I will provide you with:
 1. A list of available categories: ${JSON.stringify(categoryNames)}
-2. A list of transactions that need categorization: ${JSON.stringify(transactionsToCategorize)}
+2. A single transaction description: "${transaction.description}"
 
-Your job is to analyze each transaction's description and assign it the most fitting category from the provided list. If no category seems appropriate, assign it the category "Uncategorized".
+Analyze the transaction's description and assign it the most fitting category from the provided list. If no category seems appropriate, assign it "Uncategorized".
 
 **OUTPUT INSTRUCTIONS:**
-- Your response MUST be a single, valid JSON array.
-- Do not include any text, explanations, or markdown formatting like \`\`\`json\`\`\` before or after the JSON array.
-- Each object in the array must have two keys:
-  - "id": (string) The original ID of the transaction.
-  - "category": (string) The suggested category name from the provided list.
+- Your response MUST be a single, valid JSON object.
+- The object must have one key: "category".
+- The value should be the suggested category name as a string from the provided list.
 
 Example Output:
-[
-  {"id": "some-tx-id-1", "category": "Groceries"},
-  {"id": "some-tx-id-2", "category": "Entertainment"}
-]
+{"category": "Groceries"}
 
 Begin categorization.`;
 
@@ -294,65 +401,65 @@ Begin categorization.`;
                 model: "gemini-2.5-flash",
                 contents: { parts: [{ text: prompt }] },
                 config: {
-                  responseMimeType: "application/json",
-                  responseSchema: {
-                    type: Type.ARRAY,
-                    items: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
                         type: Type.OBJECT,
                         properties: {
-                            id: { type: Type.STRING },
                             category: { type: Type.STRING },
                         }
                     }
-                  }
                 }
             });
 
-            let jsonString = response.text.trim();
-            const suggestions = JSON.parse(jsonString);
+            const jsonString = response.text.trim();
+            const suggestion = JSON.parse(jsonString);
 
-            if (Array.isArray(suggestions)) {
-                setTransactions(prevTxs => {
-                    const updatedTxs = [...prevTxs];
-                    suggestions.forEach(suggestion => {
-                        if (suggestion.id && suggestion.category) {
-                             const txIndex = updatedTxs.findIndex(t => t.id === suggestion.id);
-                             if (txIndex !== -1) {
-                                 updatedTxs[txIndex] = { ...updatedTxs[txIndex], category: suggestion.category };
-                             }
-                        }
-                    });
-                    return updatedTxs;
-                });
+            if (suggestion && suggestion.category && categoryNames.includes(suggestion.category)) {
+                handleTransactionCategoryChange(transactionId, suggestion.category);
+            } else if (suggestion && suggestion.category) {
+                console.warn(`AI suggested a category not in the list: "${suggestion.category}". Falling back to Uncategorized.`);
             } else {
                 throw new Error("AI response was not in the expected format.");
             }
 
         } catch (error) {
-            console.error("Error suggesting categories:", error);
-            const friendlyError = `Failed to suggest categories. ${error instanceof Error ? error.message : 'Unknown error.'}`;
+            console.error("Error suggesting category:", error);
+            const friendlyError = `Failed to suggest a category. ${error instanceof Error ? error.message : 'Unknown error.'}`;
             setErrorMessage(friendlyError);
-            alert(friendlyError);
+            alert(friendlyError); // Alert for immediate feedback
         } finally {
-            setIsSuggestingCategories(false);
+            setSuggestingForTxId(null);
         }
     };
-
-    const handleStartEditingNote = (tx: Transaction) => {
-        setEditingNoteId(tx.id);
-        setEditingNoteText(tx.notes || '');
+    
+    const handleOpenNoteModal = (tx: Transaction) => {
+        setEditingTransactionForNote(tx);
     };
 
-    const handleCancelEditingNote = () => {
-        setEditingNoteId(null);
-        setEditingNoteText('');
+    const handleCloseNoteModal = () => {
+        setEditingTransactionForNote(null);
     };
 
-    const handleSaveNote = (transactionId: string) => {
+    const handleSaveNote = (transactionId: string, newNote: string) => {
+        const txToUpdate = transactions.find(t => t.id === transactionId);
+        if (!txToUpdate) {
+            handleCloseNoteModal();
+            return;
+        }
+
+        const noteKey = createTransactionKey(txToUpdate);
+        const trimmedNote = newNote.trim();
+
+        if (trimmedNote) {
+            localStorage.setItem(noteKey, trimmedNote);
+        } else {
+            localStorage.removeItem(noteKey);
+        }
+
         setTransactions(transactions.map(t =>
-            t.id === transactionId ? { ...t, notes: editingNoteText.trim() } : t
+            t.id === transactionId ? { ...t, notes: trimmedNote ? trimmedNote : undefined } : t
         ));
-        handleCancelEditingNote();
+        handleCloseNoteModal();
     };
 
 
@@ -386,13 +493,14 @@ Begin categorization.`;
         } finally {
             setTimeout(() => {
                 setIsExporting(false);
-            }, 500); // Give user feedback even for fast operations
+            }, 500);
         }
     };
 
     const handleClearFilters = () => {
         setSearchQuery('');
         setFilterCategory('all');
+        setFilterType('all');
         setFilterStartDate('');
         setFilterEndDate('');
         setFilterMinAmount('');
@@ -400,6 +508,7 @@ Begin categorization.`;
     };
     
     const resetApp = () => {
+        localStorage.removeItem('bankAnalyzerLastSession');
         setAppState('upload');
         setTransactions([]);
         setErrorMessage('');
@@ -409,6 +518,7 @@ Begin categorization.`;
     const filteredTransactions = useMemo(() => transactions.filter(tx => {
         const searchMatch = tx.description.toLowerCase().includes(searchQuery.toLowerCase());
         const categoryMatch = filterCategory === 'all' || tx.category === filterCategory;
+        const typeMatch = filterType === 'all' || tx.type === filterType;
         const startDateMatch = !filterStartDate || tx.date >= filterStartDate;
         const endDateMatch = !filterEndDate || tx.date <= filterEndDate;
         
@@ -418,8 +528,8 @@ Begin categorization.`;
         const maxMatch = filterMaxAmount === '' || isNaN(maxAmountVal) || tx.amount <= maxAmountVal;
         const amountMatch = minMatch && maxMatch;
 
-        return searchMatch && categoryMatch && startDateMatch && endDateMatch && amountMatch;
-    }), [transactions, searchQuery, filterCategory, filterStartDate, filterEndDate, filterMinAmount, filterMaxAmount]);
+        return searchMatch && categoryMatch && typeMatch && startDateMatch && endDateMatch && amountMatch;
+    }), [transactions, searchQuery, filterCategory, filterType, filterStartDate, filterEndDate, filterMinAmount, filterMaxAmount]);
 
     const handleSelectTransaction = (transactionId: string, checked: boolean) => {
         const newSelection = new Set(selectedTransactionIds);
@@ -448,6 +558,14 @@ Begin categorization.`;
         setSelectedTransactionIds(new Set());
     };
 
+    if (appState === 'init') {
+        return (
+            <div className="min-h-screen bg-slate-100 flex items-center justify-center">
+                <div className="animate-spin rounded-full h-16 w-16 border-b-4 border-indigo-600"></div>
+            </div>
+        );
+    }
+
     return (
         <div className="min-h-screen bg-slate-100 text-slate-800 flex flex-col items-center p-4 sm:p-6 lg:p-8">
             <header className="w-full max-w-6xl mb-8 text-center">
@@ -457,9 +575,10 @@ Begin categorization.`;
 
             <main className="w-full max-w-6xl bg-white rounded-xl shadow-lg p-6 sm:p-8">
                 {appState === 'upload' && <UploadScreen onFileChange={handleFileChange} />}
-                {appState === 'analyzing' && (
+                {(appState === 'analyzing' || appState === 'error' && transactions.length > 0) && (
                     <AnalysisScreen
-                        transactions={filteredTransactions}
+                        transactions={transactions}
+                        filteredTransactions={filteredTransactions}
                         categories={categories}
                         newCategoryName={newCategoryName}
                         onNewCategoryNameChange={setNewCategoryName}
@@ -481,6 +600,8 @@ Begin categorization.`;
                         isStreaming={isStreaming}
                         filterCategory={filterCategory}
                         onFilterCategoryChange={setFilterCategory}
+                        filterType={filterType}
+                        onFilterTypeChange={setFilterType}
                         filterStartDate={filterStartDate}
                         onFilterStartDateChange={setFilterStartDate}
                         filterEndDate={filterEndDate}
@@ -490,14 +611,9 @@ Begin categorization.`;
                         filterMaxAmount={filterMaxAmount}
                         onFilterMaxAmountChange={setFilterMaxAmount}
                         onClearFilters={handleClearFilters}
-                        editingNoteId={editingNoteId}
-                        editingNoteText={editingNoteText}
-                        onEditingNoteTextChange={setEditingNoteText}
-                        onStartEditingNote={handleStartEditingNote}
-                        onSaveNote={handleSaveNote}
-                        onCancelEditingNote={handleCancelEditingNote}
-                        isSuggestingCategories={isSuggestingCategories}
-                        onSuggestCategories={handleSuggestCategories}
+                        onStartEditingNote={handleOpenNoteModal}
+                        suggestingForTxId={suggestingForTxId}
+                        onSuggestSingleCategory={handleSuggestSingleCategory}
                         selectedTransactionIds={selectedTransactionIds}
                         onSelectTransaction={handleSelectTransaction}
                         onSelectAllTransactions={handleSelectAllTransactions}
@@ -505,8 +621,13 @@ Begin categorization.`;
                         onClearSelection={() => setSelectedTransactionIds(new Set())}
                     />
                 )}
-                {(appState === 'error') && <ErrorScreen message={errorMessage} onReset={resetApp} />}
+                {(appState === 'error' && transactions.length === 0) && <ErrorScreen message={errorMessage} onReset={resetApp} />}
             </main>
+             <NoteEditModal 
+                transaction={editingTransactionForNote}
+                onSave={handleSaveNote}
+                onClose={handleCloseNoteModal}
+             />
              <footer className="w-full max-w-6xl mt-8 text-center text-slate-500 text-sm">
                 <p>&copy; {new Date().getFullYear()} AI Statement Analyzer. All rights reserved.</p>
             </footer>
@@ -531,7 +652,7 @@ const UploadScreen = ({ onFileChange }: { onFileChange: (e: React.ChangeEvent<HT
 const ErrorScreen = ({ message, onReset }: { message: string, onReset: () => void }) => (
     <div className="flex flex-col items-center justify-center p-8 text-center bg-red-50 border border-red-200 rounded-lg">
         <h2 className="text-2xl font-semibold text-red-700">An Error Occurred</h2>
-        <p className="text-red-600 mt-2 mb-6">{message}</p>
+        <p className="text-red-600 mt-2 mb-6">{message || "Something went wrong. Please try again."}</p>
         <button onClick={onReset} className="bg-red-600 text-white font-semibold py-2 px-6 rounded-lg shadow-md hover:bg-red-700 transition-colors">
             Try Again
         </button>
@@ -590,6 +711,7 @@ const BulkEditBar: React.FC<{
 
 interface AnalysisScreenProps {
     transactions: Transaction[];
+    filteredTransactions: Transaction[];
     categories: Category[];
     newCategoryName: string;
     onNewCategoryNameChange: (value: string) => void;
@@ -611,6 +733,8 @@ interface AnalysisScreenProps {
     isStreaming: boolean;
     filterCategory: string;
     onFilterCategoryChange: (value: string) => void;
+    filterType: 'all' | 'debit' | 'credit';
+    onFilterTypeChange: (value: 'all' | 'debit' | 'credit') => void;
     filterStartDate: string;
     onFilterStartDateChange: (value: string) => void;
     filterEndDate: string;
@@ -620,14 +744,9 @@ interface AnalysisScreenProps {
     filterMaxAmount: string;
     onFilterMaxAmountChange: (value: string) => void;
     onClearFilters: () => void;
-    editingNoteId: string | null;
-    editingNoteText: string;
-    onEditingNoteTextChange: (value: string) => void;
     onStartEditingNote: (tx: Transaction) => void;
-    onSaveNote: (transactionId: string) => void;
-    onCancelEditingNote: () => void;
-    isSuggestingCategories: boolean;
-    onSuggestCategories: () => void;
+    suggestingForTxId: string | null;
+    onSuggestSingleCategory: (transactionId: string) => void;
     selectedTransactionIds: Set<string>;
     onSelectTransaction: (id: string, checked: boolean) => void;
     onSelectAllTransactions: (checked: boolean) => void;
@@ -636,23 +755,20 @@ interface AnalysisScreenProps {
 }
 
 const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
-    transactions, categories, newCategoryName, onNewCategoryNameChange,
+    transactions, filteredTransactions, categories, newCategoryName, onNewCategoryNameChange,
     onAddCategory, onDeleteCategory, onTransactionCategoryChange, onExport, onReset,
     editingCategoryId, deletingCategoryId, editingCategoryName, onEditingCategoryNameChange,
     onStartEditingCategory, onSaveCategory, onCancelEditing,
     searchQuery, onSearchQueryChange, isStreaming,
-    filterCategory, onFilterCategoryChange, filterStartDate, onFilterStartDateChange,
+    filterCategory, onFilterCategoryChange, filterType, onFilterTypeChange, filterStartDate, onFilterStartDateChange,
     filterEndDate, onFilterEndDateChange, filterMinAmount, onFilterMinAmountChange,
     filterMaxAmount, onFilterMaxAmountChange, onClearFilters,
-    editingNoteId, editingNoteText, onEditingNoteTextChange, onStartEditingNote,
-    onSaveNote, onCancelEditingNote, isSuggestingCategories, onSuggestCategories,
+    onStartEditingNote, suggestingForTxId, onSuggestSingleCategory,
     isExporting,
     selectedTransactionIds, onSelectTransaction, onSelectAllTransactions, onApplyBulkCategory, onClearSelection
 }) => {
     
     const summary = useMemo(() => {
-        // NOTE: Summary is calculated on all transactions, not just filtered ones.
-        // This is intentional to provide an overview of the entire statement.
         const allTransactions = transactions; 
         
         const totalDebits = allTransactions
@@ -665,13 +781,16 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
 
         const spendingByCategory = allTransactions
             .filter(t => t.type === 'debit')
-            .reduce((acc, t) => {
+            // FIX: Explicitly set the generic type for reduce to ensure correct type inference.
+// FIX: Changed reduce call to type the accumulator argument instead of using a generic on the function call, resolving a TypeScript error.
+            .reduce((acc: Record<string, number>, t) => {
                 const category = t.category || 'Uncategorized';
                 acc[category] = (acc[category] || 0) + t.amount;
                 return acc;
-            }, {} as Record<string, number>);
+            }, {});
 
         const sortedSpending = Object.entries(spendingByCategory)
+// FIX: This line no longer errors because the `reduce` fix above ensures `spendingByCategory` is correctly typed, allowing `sort` to operate on numbers.
             .sort((a, b) => b[1] - a[1]);
             
         return {
@@ -686,21 +805,11 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
     useEffect(() => {
         if (headerCheckboxRef.current) {
             const numSelected = selectedTransactionIds.size;
-// FIX: The indeterminate state of the "select all" checkbox should be based on the count of *filtered* transactions, not all transactions.
-            const numVisible = transactions.length;
-            if (numSelected > 0 && numSelected < numVisible) {
-                headerCheckboxRef.current.indeterminate = true;
-            } else {
-                headerCheckboxRef.current.indeterminate = false;
-            }
+            const numVisible = filteredTransactions.length;
+            const isPartiallySelected = numSelected > 0 && numSelected < numVisible;
+            headerCheckboxRef.current.indeterminate = isPartiallySelected;
         }
-    // FIX: Using primitive values for dependencies in useEffect.
-    // The original code used `selectedTransactionIds` and `transactions` (objects) as dependencies,
-    // which caused the effect to run on every render.
-    // The effect logic only depends on the size/length of these objects, so using primitive values
-    // is more correct and performant. This may also resolve the confusing linter error.
-    // Also, dependency should be on filtered transactions length.
-    }, [selectedTransactionIds.size, transactions.length]);
+    }, [selectedTransactionIds, filteredTransactions]);
 
 
     return (
@@ -709,19 +818,6 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
             <div className="md:col-span-1 bg-slate-50 p-4 rounded-lg border">
                  <div className="flex justify-between items-center mb-3">
                     <h3 className="text-lg font-semibold">Manage Categories</h3>
-                    <button
-                        onClick={onSuggestCategories}
-                        disabled={isSuggestingCategories}
-                        className="flex items-center space-x-2 text-sm bg-indigo-100 text-indigo-700 font-semibold py-1 px-3 rounded-lg shadow-sm hover:bg-indigo-200 transition-colors disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed"
-                        aria-label="Suggest categories with AI"
-                    >
-                        {isSuggestingCategories ? (
-                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-700"></div>
-                        ) : (
-                            <SparklesIcon className="w-4 h-4" />
-                        )}
-                        <span>{isSuggestingCategories ? 'Thinking...' : 'AI Suggest'}</span>
-                    </button>
                 </div>
                 <div className="flex items-center space-x-2 mb-4">
                     <input
@@ -846,12 +942,21 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
 
         <div className="mb-6 p-4 bg-slate-50 rounded-lg border">
             <h3 className="text-lg font-semibold mb-3">Filter Transactions</h3>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
                 <div>
                     <label htmlFor="filter-category" className="block text-sm font-medium text-slate-600 mb-1">Category</label>
                     <select id="filter-category" value={filterCategory} onChange={e => onFilterCategoryChange(e.target.value)} className="w-full p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white">
                         <option value="all">All Categories</option>
+                        <option value="Uncategorized">Uncategorized</option>
                         {categories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+                    </select>
+                </div>
+                 <div>
+                    <label htmlFor="filter-type" className="block text-sm font-medium text-slate-600 mb-1">Type</label>
+                    <select id="filter-type" value={filterType} onChange={e => onFilterTypeChange(e.target.value as 'all' | 'debit' | 'credit')} className="w-full p-2 border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white">
+                        <option value="all">All Types</option>
+                        <option value="debit">Debit</option>
+                        <option value="credit">Credit</option>
                     </select>
                 </div>
                 <div>
@@ -876,8 +981,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
         </div>
 
         <div className="flex justify-between items-center mb-4">
-            {/* FIX: The transaction count should reflect the number of filtered transactions. */}
-            <h3 className="text-xl font-semibold">Transactions ({transactions.length})</h3>
+            <h3 className="text-xl font-semibold">Transactions ({filteredTransactions.length})</h3>
             <div className="w-full max-w-xs">
                 <input
                     type="text"
@@ -907,8 +1011,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                                 ref={headerCheckboxRef}
                                 type="checkbox"
                                 className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-// FIX: The `checked` state should be determined by comparing the number of selected transactions to the number of *filtered* transactions.
-                                checked={transactions.length > 0 && selectedTransactionIds.size === transactions.length}
+                                checked={filteredTransactions.length > 0 && selectedTransactionIds.size === filteredTransactions.length}
                                 onChange={(e) => onSelectAllTransactions(e.target.checked)}
                                 aria-label="Select all transactions"
                             />
@@ -922,8 +1025,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                     </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-slate-200">
-                    {/* FIX: The table should render the `filteredTransactions`, not the entire `transactions` list. */}
-                    {transactions.map(tx => (
+                    {filteredTransactions.map(tx => (
                         <tr key={tx.id} className={selectedTransactionIds.has(tx.id) ? 'bg-indigo-50' : ''}>
                              <td className="px-4 py-4 whitespace-nowrap">
                                 <input
@@ -945,51 +1047,45 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                                 </span>
                             </td>
                             <td className="px-6 py-4 whitespace-nowrap text-sm">
-                                <select 
-                                    value={tx.category} 
-                                    onChange={(e) => onTransactionCategoryChange(tx.id, e.target.value)}
-                                    className="p-1 border border-slate-300 rounded-md focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 bg-white"
-                                >
-                                    <option>Uncategorized</option>
-                                    {categories.map(cat => <option key={cat.id} value={cat.name}>{cat.name}</option>)}
-                                </select>
+                                <div className="flex items-center space-x-2">
+                                    <select 
+                                        value={tx.category} 
+                                        onChange={(e) => onTransactionCategoryChange(tx.id, e.target.value)}
+                                        className="p-1 border border-slate-300 rounded-md focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                                        disabled={suggestingForTxId === tx.id}
+                                    >
+                                        <option>Uncategorized</option>
+                                        {categories.map(cat => <option key={cat.id} value={cat.name}>{cat.name}</option>)}
+                                    </select>
+                                    {suggestingForTxId === tx.id ? (
+                                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-600"></div>
+                                    ) : (
+                                        tx.category === 'Uncategorized' && (
+                                            <button
+                                                onClick={() => onSuggestSingleCategory(tx.id)}
+                                                className="text-slate-400 hover:text-indigo-500 transition-colors p-1 rounded-full hover:bg-slate-100"
+                                                aria-label={`Suggest category for ${tx.description}`}
+                                                title="Suggest category with AI"
+                                            >
+                                                <SparklesIcon className="w-4 h-4"/>
+                                            </button>
+                                        )
+                                    )}
+                                </div>
                             </td>
                             <td className="px-6 py-4 whitespace-normal text-sm text-slate-600 min-w-[200px]">
-                                {editingNoteId === tx.id ? (
-                                    <div className="flex items-start space-x-2">
-                                        <textarea
-                                            value={editingNoteText}
-                                            onChange={(e) => onEditingNoteTextChange(e.target.value)}
-                                            className="w-full p-1 border border-indigo-300 rounded-md focus:ring-1 focus:ring-indigo-500 text-sm"
-                                            onKeyDown={(e) => {
-                                                if (e.key === 'Enter' && !e.shiftKey) {
-                                                    e.preventDefault();
-                                                    onSaveNote(tx.id);
-                                                }
-                                                if (e.key === 'Escape') onCancelEditingNote();
-                                            }}
-                                            rows={2}
-                                            autoFocus
-                                        />
-                                        <div className="flex flex-col space-y-1">
-                                            <button onClick={() => onSaveNote(tx.id)} className="text-green-500 hover:text-green-700 p-1 rounded-full hover:bg-green-100 transition-colors">
-                                                <CheckIcon className="w-5 h-5"/>
-                                            </button>
-                                            <button onClick={onCancelEditingNote} className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-100 transition-colors">
-                                                <XIcon className="w-5 h-5"/>
-                                            </button>
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div className="group flex items-start justify-between min-h-[38px]">
-                                        <p className={`whitespace-pre-wrap ${tx.notes ? 'text-slate-700' : 'italic text-slate-400'}`}>
-                                            {tx.notes || 'Add a note...'}
-                                        </p>
-                                        <button onClick={() => onStartEditingNote(tx)} className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-indigo-500 transition-opacity ml-2 shrink-0">
-                                            <PencilIcon className="w-4 h-4"/>
-                                        </button>
-                                    </div>
-                                )}
+                                <div className="group flex items-start justify-between">
+                                    <p className={`whitespace-pre-wrap flex-grow pr-2 ${tx.notes ? 'text-slate-700' : 'italic text-slate-400'}`}>
+                                        {tx.notes || 'No note'}
+                                    </p>
+                                    <button 
+                                        onClick={() => onStartEditingNote(tx)} 
+                                        className="opacity-25 group-hover:opacity-100 text-slate-400 hover:text-indigo-500 transition-opacity ml-2 shrink-0 p-1 rounded-full hover:bg-slate-100"
+                                        aria-label={`Edit note for ${tx.description}`}
+                                    >
+                                        <PencilIcon className="w-4 h-4"/>
+                                    </button>
+                                </div>
                             </td>
                         </tr>
                     ))}
@@ -1003,10 +1099,10 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                             </td>
                         </tr>
                     )}
-                    {transactions.length === 0 && !isStreaming && (
+                    {filteredTransactions.length === 0 && !isStreaming && (
                         <tr>
                             <td colSpan={7} className="text-center py-8 text-slate-500">
-                                {searchQuery || filterCategory !== 'all' || filterStartDate || filterEndDate || filterMinAmount || filterMaxAmount 
+                                {searchQuery || filterCategory !== 'all' || filterType !== 'all' || filterStartDate || filterEndDate || filterMinAmount || filterMaxAmount 
                                 ? 'No transactions match your filters.' 
                                 : 'No transactions were found in the document.'}
                             </td>
