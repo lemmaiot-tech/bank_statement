@@ -1,4 +1,6 @@
-import React, { useState, useEffect } from 'react';
+
+
+import React, { useState, useEffect, useMemo } from 'react';
 import { GoogleGenAI } from "@google/genai";
 import { Transaction, Category } from './types';
 import { UploadIcon, TrashIcon, DownloadIcon, PlusIcon, PencilIcon, CheckIcon, XIcon } from './components/icons';
@@ -87,8 +89,21 @@ const App: React.FC = () => {
     
                 const pdfPart = await fileToGenerativePart(file);
 
-                const prompt = `Analyze the bank statement in the provided PDF. Extract each transaction and return it as a single, minified JSON object on its own line. Do not include any other text, explanations, or markdown formatting like \`\`\`json. Each line MUST be a valid JSON object.
-The JSON object must have these keys: "date" (string in YYYY-MM-DD format), "description" (string), "amount" (number), and "type" ("debit" or "credit").`;
+                const prompt = `You are an expert data extraction AI specializing in financial documents. Your single task is to meticulously analyze the provided PDF bank statement and extract every transaction.
+
+**CRITICAL INSTRUCTIONS:**
+1.  **PROCESS THE ENTIRE DOCUMENT**: It is absolutely essential that you process the PDF from the first page to the last. Do not stop partway through. Extract all transactions until the very end of the statement.
+2.  **STRICT OUTPUT FORMAT**:
+    - Each transaction MUST be a single, minified JSON object on its own line.
+    - There should be NO other text, explanations, summaries, or markdown formatting (like \`\`\`json) in your output. Only a stream of JSON objects.
+3.  **REQUIRED JSON FIELDS**: Each JSON object must contain these exact keys and data types:
+    - "date": (string) in "YYYY-MM-DD" format.
+    - "description": (string) for the transaction details.
+    - "amount": (number) for the transaction value.
+    - "type": (string) which must be either "debit" or "credit".
+4.  **CURRENCY CONTEXT**: All amounts are in Nigerian Naira (NGN). Do not include currency symbols or codes in the "amount" field.
+
+Failure to process the entire document will result in an incorrect analysis. Begin extraction.`;
 
                 const stream = await ai.models.generateContentStream({
                     model: "gemini-2.5-flash",
@@ -379,6 +394,14 @@ const ErrorScreen = ({ message, onReset }: { message: string, onReset: () => voi
     </div>
 );
 
+const SummaryCard = ({ title, amount, currency, colorClass }: { title: string; amount: number; currency: string; colorClass: string }) => (
+    <div className="bg-white p-4 rounded-lg border shadow-sm">
+        <h4 className="text-sm font-medium text-slate-500">{title}</h4>
+        <p className={`text-2xl font-bold ${colorClass}`}>
+            {amount < 0 && '-'}{currency}{Math.abs(amount).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        </p>
+    </div>
+);
 
 interface AnalysisScreenProps {
     transactions: Transaction[];
@@ -430,7 +453,40 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
     filterMaxAmount, onFilterMaxAmountChange, onClearFilters,
     editingNoteId, editingNoteText, onEditingNoteTextChange, onStartEditingNote,
     onSaveNote, onCancelEditingNote
-}) => (
+}) => {
+    
+    const summary = useMemo(() => {
+        const totalDebits = transactions
+            .filter(t => t.type === 'debit')
+            // Fix: Explicitly type the accumulator to ensure it's treated as a number.
+            .reduce((sum: number, t) => sum + t.amount, 0);
+
+        const totalCredits = transactions
+            .filter(t => t.type === 'credit')
+            // Fix: Explicitly type the accumulator to ensure it's treated as a number.
+            .reduce((sum: number, t) => sum + t.amount, 0);
+
+        const spendingByCategory = transactions
+            .filter(t => t.type === 'debit')
+            .reduce((acc, t) => {
+                const category = t.category || 'Uncategorized';
+                acc[category] = (acc[category] || 0) + t.amount;
+                return acc;
+            }, {} as Record<string, number>);
+
+        const sortedSpending = Object.entries(spendingByCategory)
+            // Fix: Use index access for sorting to ensure correct type inference for amounts.
+            .sort((a, b) => b[1] - a[1]);
+            
+        return {
+            totalDebits,
+            totalCredits,
+            netFlow: totalCredits - totalDebits,
+            spendingByCategory: sortedSpending,
+        };
+    }, [transactions]);
+
+    return (
     <div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-8">
             <div className="md:col-span-1 bg-slate-50 p-4 rounded-lg border">
@@ -495,16 +551,50 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                      {categories.length === 0 && <p className="text-slate-500 text-sm text-center p-4">No categories added yet.</p>}
                 </ul>
             </div>
-            <div className="md:col-span-2 flex flex-col items-start space-y-4">
-                 <h3 className="text-lg font-semibold">Actions</h3>
-                <div className="flex space-x-4">
-                    <button onClick={onExport} className="flex items-center space-x-2 bg-green-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-green-700 transition-colors">
-                        <DownloadIcon className="w-5 h-5" />
-                        <span>Export to CSV</span>
-                    </button>
-                    <button onClick={onReset} className="flex items-center space-x-2 bg-slate-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-slate-700 transition-colors">
-                        <span>Analyze New Statement</span>
-                    </button>
+            <div className="md:col-span-2 space-y-8">
+                 {transactions.length > 0 && (
+                    <div className="bg-slate-50 p-4 rounded-lg border">
+                        <h3 className="text-lg font-semibold mb-3">Transaction Summary</h3>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+                            <SummaryCard title="Total Credits" amount={summary.totalCredits} currency="₦" colorClass="text-green-600" />
+                            <SummaryCard title="Total Debits" amount={summary.totalDebits} currency="₦" colorClass="text-red-600" />
+                            <SummaryCard title="Net Flow" amount={summary.netFlow} currency="₦" colorClass={summary.netFlow >= 0 ? 'text-slate-800' : 'text-red-600'} />
+                        </div>
+                        <div>
+                            <h4 className="text-md font-semibold mb-2">Spending by Category</h4>
+                            <div className="bg-white p-4 rounded-lg border shadow-sm max-h-48 overflow-y-auto">
+                                {summary.spendingByCategory.length > 0 && summary.totalDebits > 0 ? (
+                                    <ul className="space-y-2">
+                                        {summary.spendingByCategory.map(([category, amount]) => (
+                                            <li key={category} className="flex justify-between items-center text-sm">
+                                                <span className="text-slate-700">{category}</span>
+                                                <div className="flex items-center space-x-2">
+                                                    <span className="font-semibold text-slate-800">₦{amount.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                                    <span className="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">
+                                                        {((amount / summary.totalDebits) * 100).toFixed(1)}%
+                                                    </span>
+                                                </div>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                ) : (
+                                    <p className="text-slate-500 text-sm text-center">No debit transactions to summarize.</p>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
+                <div className="flex flex-col items-start space-y-4">
+                    <h3 className="text-lg font-semibold">Actions</h3>
+                    <div className="flex space-x-4">
+                        <button onClick={onExport} className="flex items-center space-x-2 bg-green-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-green-700 transition-colors">
+                            <DownloadIcon className="w-5 h-5" />
+                            <span>Export to CSV</span>
+                        </button>
+                        <button onClick={onReset} className="flex items-center space-x-2 bg-slate-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md hover:bg-slate-700 transition-colors">
+                            <span>Analyze New Statement</span>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -571,7 +661,7 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">{tx.date}</td>
                             <td className="px-6 py-4 whitespace-normal text-sm text-slate-800 max-w-xs break-words">{tx.description}</td>
                             <td className={`px-6 py-4 whitespace-nowrap text-sm text-right font-medium ${tx.type === 'debit' ? 'text-red-600' : 'text-green-600'}`}>
-                                {tx.type === 'debit' ? '-' : '+'}${tx.amount.toFixed(2)}
+                                {tx.type === 'debit' ? '-' : '+'}₦{tx.amount.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                             </td>
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">
                                 <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${tx.type === 'debit' ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'}`}>
@@ -650,6 +740,6 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
             </table>
         </div>
     </div>
-);
+)};
 
 export default App;
