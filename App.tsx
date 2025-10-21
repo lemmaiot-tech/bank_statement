@@ -1,4 +1,5 @@
 
+
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 import { Transaction, Category } from './types';
@@ -709,6 +710,97 @@ const BulkEditBar: React.FC<{
     );
 };
 
+interface TransactionCardProps {
+    tx: Transaction;
+    categories: Category[];
+    selectedTransactionIds: Set<string>;
+    suggestingForTxId: string | null;
+    onSelectTransaction: (id: string, checked: boolean) => void;
+    onTransactionCategoryChange: (transactionId: string, category: string) => void;
+    onSuggestSingleCategory: (transactionId: string) => void;
+    onStartEditingNote: (tx: Transaction) => void;
+}
+
+const TransactionCard: React.FC<TransactionCardProps> = ({
+    tx,
+    categories,
+    selectedTransactionIds,
+    suggestingForTxId,
+    onSelectTransaction,
+    onTransactionCategoryChange,
+    onSuggestSingleCategory,
+    onStartEditingNote,
+}) => (
+    <div className={`bg-white rounded-lg border p-4 ${selectedTransactionIds.has(tx.id) ? 'border-indigo-300 ring-2 ring-indigo-200' : 'border-slate-200'}`}>
+        <div className="flex justify-between items-start gap-4">
+            <div className="flex items-start space-x-3">
+                <input
+                    type="checkbox"
+                    className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500 mt-1 flex-shrink-0"
+                    checked={selectedTransactionIds.has(tx.id)}
+                    onChange={(e) => onSelectTransaction(tx.id, e.target.checked)}
+                    aria-label={`Select transaction ${tx.description}`}
+                />
+                <div className="flex-grow">
+                    <p className="font-semibold text-slate-800 break-words">{tx.description}</p>
+                    <p className="text-sm text-slate-500">{tx.date}</p>
+                </div>
+            </div>
+            <div className={`text-base font-bold whitespace-nowrap text-right ${tx.type === 'debit' ? 'text-red-600' : 'text-green-600'}`}>
+                {tx.type === 'debit' ? '-' : '+'}₦{tx.amount.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                <span className={`mt-1 block text-xs font-semibold rounded-full text-center ${tx.type === 'debit' ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'}`}>
+                    {tx.type.charAt(0).toUpperCase() + tx.type.slice(1)}
+                </span>
+            </div>
+        </div>
+
+        <div className="mt-4 pt-3 border-t border-slate-200">
+            <label className="text-xs font-medium text-slate-500 uppercase">Category</label>
+            <div className="flex items-center space-x-2 mt-1">
+                 <select 
+                    value={tx.category} 
+                    onChange={(e) => onTransactionCategoryChange(tx.id, e.target.value)}
+                    className="w-full p-2 border border-slate-300 rounded-md focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 bg-white text-sm"
+                    disabled={suggestingForTxId === tx.id}
+                >
+                    <option>Uncategorized</option>
+                    {categories.map(cat => <option key={cat.id} value={cat.name}>{cat.name}</option>)}
+                </select>
+                {suggestingForTxId === tx.id ? (
+                    <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-indigo-600"></div>
+                ) : (
+                    tx.category === 'Uncategorized' && (
+                        <button
+                            onClick={() => onSuggestSingleCategory(tx.id)}
+                            className="text-slate-400 hover:text-indigo-500 transition-colors p-1 rounded-full hover:bg-slate-100"
+                            aria-label={`Suggest category for ${tx.description}`}
+                            title="Suggest category with AI"
+                        >
+                            <SparklesIcon className="w-5 h-5"/>
+                        </button>
+                    )
+                )}
+            </div>
+        </div>
+        
+         <div className="mt-3 pt-3 border-t border-slate-200">
+            <div className="flex items-center justify-between">
+                <label className="text-xs font-medium text-slate-500 uppercase">Notes</label>
+                <button 
+                    onClick={() => onStartEditingNote(tx)} 
+                    className="text-slate-400 hover:text-indigo-500 transition-opacity p-1 rounded-full hover:bg-slate-100"
+                    aria-label={`Edit note for ${tx.description}`}
+                >
+                    <PencilIcon className="w-4 h-4"/>
+                </button>
+            </div>
+             <p className={`mt-1 text-sm whitespace-pre-wrap ${tx.notes ? 'text-slate-700' : 'italic text-slate-400'}`}>
+                {tx.notes || 'No note'}
+            </p>
+        </div>
+    </div>
+);
+
 interface AnalysisScreenProps {
     transactions: Transaction[];
     filteredTransactions: Transaction[];
@@ -781,9 +873,8 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
 
         const spendingByCategory = allTransactions
             .filter(t => t.type === 'debit')
-            // FIX: Explicitly set the generic type for reduce to ensure correct type inference.
-// FIX: Changed reduce call to type the accumulator argument instead of using a generic on the function call, resolving a TypeScript error.
-            .reduce((acc: Record<string, number>, t) => {
+            // FIX: Provided a generic type argument to `reduce` to ensure `spendingByCategory` is correctly typed as `Record<string, number>`.
+            .reduce<Record<string, number>>((acc, t) => {
                 const category = t.category || 'Uncategorized';
                 acc[category] = (acc[category] || 0) + t.amount;
                 return acc;
@@ -801,14 +892,20 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
         };
     }, [transactions]);
 
-    const headerCheckboxRef = useRef<HTMLInputElement>(null);
+    const tableHeaderCheckboxRef = useRef<HTMLInputElement>(null);
+    const mobileHeaderCheckboxRef = useRef<HTMLInputElement>(null);
+    
     useEffect(() => {
-        if (headerCheckboxRef.current) {
-            const numSelected = selectedTransactionIds.size;
-            const numVisible = filteredTransactions.length;
-            const isPartiallySelected = numSelected > 0 && numSelected < numVisible;
-            headerCheckboxRef.current.indeterminate = isPartiallySelected;
-        }
+        const refs = [tableHeaderCheckboxRef, mobileHeaderCheckboxRef];
+        const numSelected = selectedTransactionIds.size;
+        const numVisible = filteredTransactions.length;
+        const isPartiallySelected = numVisible > 0 && numSelected > 0 && numSelected < numVisible;
+
+        refs.forEach(ref => {
+            if (ref.current) {
+                ref.current.indeterminate = isPartiallySelected;
+            }
+        });
     }, [selectedTransactionIds, filteredTransactions]);
 
 
@@ -1002,13 +1099,14 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
             />
         )}
         
-        <div className="overflow-x-auto">
+        {/* Desktop Table View */}
+        <div className="overflow-x-auto hidden md:block">
             <table className="min-w-full divide-y divide-slate-200">
                 <thead className="bg-slate-50">
                     <tr>
                         <th className="px-4 py-3 text-left">
                             <input
-                                ref={headerCheckboxRef}
+                                ref={tableHeaderCheckboxRef}
                                 type="checkbox"
                                 className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
                                 checked={filteredTransactions.length > 0 && selectedTransactionIds.size === filteredTransactions.length}
@@ -1110,6 +1208,56 @@ const AnalysisScreen: React.FC<AnalysisScreenProps> = ({
                     )}
                 </tbody>
             </table>
+        </div>
+
+        {/* Mobile Card View */}
+        <div className="block md:hidden">
+             {filteredTransactions.length > 0 && (
+                 <div className="flex items-center space-x-3 py-2 px-1 mb-2 border-b">
+                    <input
+                        id="select-all-mobile"
+                        ref={mobileHeaderCheckboxRef}
+                        type="checkbox"
+                        className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                        checked={filteredTransactions.length > 0 && selectedTransactionIds.size === filteredTransactions.length}
+                        onChange={(e) => onSelectAllTransactions(e.target.checked)}
+                        aria-label="Select all transactions"
+                    />
+                    <label htmlFor="select-all-mobile" className="text-sm font-medium text-slate-600">
+                        {selectedTransactionIds.size === filteredTransactions.length ? 'Deselect All' : 'Select All'}
+                    </label>
+                </div>
+            )}
+            <div className="space-y-3">
+                {filteredTransactions.map(tx => (
+                    <TransactionCard
+                        key={tx.id}
+                        tx={tx}
+                        categories={categories}
+                        selectedTransactionIds={selectedTransactionIds}
+                        suggestingForTxId={suggestingForTxId}
+                        onSelectTransaction={onSelectTransaction}
+                        onTransactionCategoryChange={onTransactionCategoryChange}
+                        onSuggestSingleCategory={onSuggestSingleCategory}
+                        onStartEditingNote={onStartEditingNote}
+                    />
+                ))}
+            </div>
+             {isStreaming && (
+                <div className="text-center py-8 text-slate-500">
+                    <div className="flex items-center justify-center space-x-2">
+                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-indigo-600"></div>
+                        <span>Streaming transactions from AI...</span>
+                    </div>
+                </div>
+            )}
+            {filteredTransactions.length === 0 && !isStreaming && (
+                <div className="text-center py-8 text-slate-500">
+                    {searchQuery || filterCategory !== 'all' || filterType !== 'all' || filterStartDate || filterEndDate || filterMinAmount || filterMaxAmount 
+                    ? 'No transactions match your filters.' 
+                    : 'No transactions were found in the document.'}
+                </div>
+            )}
         </div>
     </div>
 )};
