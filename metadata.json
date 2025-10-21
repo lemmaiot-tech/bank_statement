@@ -1,0 +1,5 @@
+{
+  "name": "AI Bank Statement Analyzer",
+  "description": "Upload your bank statement in PDF format, create custom spending categories, and let AI automatically extract and help you categorize your transactions. Export your analyzed statement to an Excel-compatible CSV file.",
+  "requestFramePermissions": []
+}
