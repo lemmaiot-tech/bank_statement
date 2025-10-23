@@ -12,3 +12,11 @@ export interface Category {
   id:string;
   name: string;
 }
+
+export interface Session {
+  id: string;
+  name: string;
+  timestamp: number;
+  transactions: Transaction[];
+  categories: Category[];
+}

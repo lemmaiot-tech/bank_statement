@@ -47,3 +47,30 @@ export const SparklesIcon = ({ className }: { className?: string }) => (
     <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.75 8.25L18 6l-.75 2.25a3 3 0 00-2.25 2.25L12 9l2.25.75a3 3 0 002.25 2.25L18 12l.75-2.25a3 3 0 002.25-2.25L23.25 9l-2.25-.75a3 3 0 00-2.25-2.25zM12 2.25L11.25 4.5 9 5.25l2.25.75L12 8.25l.75-2.25L15 5.25l-2.25-.75L12 2.25z" />
   </svg>
 );
+
+export const ArrowUpDownIcon = ({ className, direction }: { className?: string, direction: 'asc' | 'desc' | 'none' }) => {
+    let d;
+    switch(direction) {
+        case 'asc':
+            d = "M4.5 15.75l7.5-7.5 7.5 7.5";
+            break;
+        case 'desc':
+            d = "M19.5 8.25l-7.5 7.5-7.5-7.5";
+            break;
+        default:
+            d = "M8.25 15L12 18.75 15.75 15m-7.5-6L12 5.25 15.75 9";
+            break;
+    }
+
+    return (
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className || 'w-6 h-6'}>
+            <path strokeLinecap="round" strokeLinejoin="round" d={d} />
+        </svg>
+    )
+};
+
+export const SaveIcon = ({ className }: { className?: string }) => (
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className || 'w-6 h-6'}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 13.5l3 3m0 0l3-3m-3 3v-6m1.06-4.19l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z" />
+    </svg>
+);
